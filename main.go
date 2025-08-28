@@ -1,19 +1,47 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
+	"github.com/joho/godotenv"
 )
 
-// ... (структуры Link, Meta, Response остаются без изменений) ...
+// !!! НОВОЕ: Список ключевых слов для обнаружения CAPTCHA на разных сайтах !!!
+var captchaKeywords = []string{
+	// Русские
+	"капча",
+	"не робот",
+	"подозрительная активность",
+	"подтвердите, что",
+
+	// Английские
+	"unusual traffic",
+	"are you a robot",
+	"prove you are human",
+	"captcha",
+}
+
+// --- Глобальное состояние для управления CAPTCHA ---
+var (
+	persistentBrowserCtx context.Context
+	isCaptchaPending     bool
+	captchaMutex         sync.Mutex
+)
+
+// ... (структуры Link, Meta, Response без изменений) ...
 type Link struct {
 	Href string `json:"href"`
 	Text string `json:"text"`
@@ -29,118 +57,213 @@ type Response struct {
 	Meta    *Meta  `json:"meta,omitempty"`
 }
 
-func scrapeHandler(allocCtx context.Context) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		url := r.URL.Query().Get("url")
-		if url == "" {
-			http.Error(w, "Необходимо указать параметр 'url'", http.StatusBadRequest)
-			return
+// ... (sendTelegramNotification без изменений) ...
+func sendTelegramNotification(message string) {
+	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+	chatID := os.Getenv("TELEGRAM_CHAT_ID")
+	if botToken == "" || chatID == "" {
+		log.Println("ЛОГ: Переменные TELEGRAM не установлены, уведомление пропущено.")
+		return
+	}
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", botToken)
+	requestBody, _ := json.Marshal(map[string]string{"chat_id": chatID, "text": message})
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(apiURL, "application/json", bytes.NewBuffer(requestBody))
+	if err != nil {
+		log.Printf("ЛОГ: Ошибка отправки в Telegram: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		log.Println("ЛОГ: Уведомление в Telegram успешно отправлено.")
+	} else {
+		log.Printf("ЛОГ: Telegram API вернул ошибку: %s", resp.Status)
+	}
+}
+
+// detectAndPauseOnCaptcha - теперь проверяет по списку ключевых слов.
+func detectAndPauseOnCaptcha(url string) chromedp.Action {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		log.Println("ЛОГ: Шаг [1] - Проверяю наличие CAPTCHA на странице.")
+		var bodyText string
+		if err := chromedp.Text(`body`, &bodyText, chromedp.ByQuery).Do(ctx); err != nil {
+			return err
 		}
 
-		ctx, cancel := chromedp.NewContext(allocCtx)
-		defer cancel()
-		ctx, cancel = context.WithTimeout(ctx, 25*time.Second) // Увеличим общий таймаут
-		defer cancel()
+		// Приводим текст страницы к нижнему регистру для надежного поиска
+		lowerBodyText := strings.ToLower(bodyText)
 
-		var response Response
-		var tasks chromedp.Tasks
+		// !!! ИЗМЕНЕННАЯ ЛОГИКА: Ищем любое из ключевых слов !!!
+		for _, keyword := range captchaKeywords {
+			if strings.Contains(lowerBodyText, keyword) {
+				// Нашли! Запускаем процедуру ожидания.
+				captchaMutex.Lock()
+				isCaptchaPending = true
+				captchaMutex.Unlock()
 
-		tasks = append(tasks, chromedp.Navigate(url))
-		tasks = append(tasks, chromedp.WaitVisible(`body`, chromedp.ByQuery))
-		// !!! ДОБАВЛЕНО: Небольшая задержка для имитации поведения пользователя
-		tasks = append(tasks, chromedp.Sleep(2*time.Second))
+				message := fmt.Sprintf("🚨 ОБНАРУЖЕНА CAPTCHA! (Найдено слово: '%s') 🚨\n\nURL: %s\n\nДействие остановлено. Пожалуйста, решите капчу и нажмите Enter в этой консоли.", keyword, url)
+				go sendTelegramNotification(message)
 
-		// ... (логика для content, links, meta остается без изменений) ...
-		if r.URL.Query().Has("content") {
-			var content string
-			tasks = append(tasks, chromedp.Text(`body`, &content, chromedp.ByQuery))
-			tasks = append(tasks, chromedp.ActionFunc(func(c context.Context) error {
+				log.Println("\n======================================================================")
+				log.Println(message)
+				log.Println("======================================================================")
+
+				for {
+					captchaMutex.Lock()
+					if !isCaptchaPending {
+						captchaMutex.Unlock()
+						break
+					}
+					captchaMutex.Unlock()
+					time.Sleep(1 * time.Second)
+				}
+
+				log.Println("ЛОГ: Enter нажат, продолжаю выполнение...")
+				return chromedp.Sleep(2 * time.Second).Do(ctx)
+			}
+		}
+
+		log.Println("ЛОГ: Шаг [1] - CAPTCHA не обнаружена, продолжаю.")
+		return nil
+	})
+}
+
+func scrapeHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("\nЛОГ: Получен новый запрос: %s", r.URL.String())
+
+	captchaMutex.Lock()
+	if isCaptchaPending {
+		captchaMutex.Unlock()
+		log.Println("ЛОГ: Отклоняю запрос, так как уже решается CAPTCHA.")
+		http.Error(w, "Сервис занят решением CAPTCHA. Попробуйте позже.", http.StatusServiceUnavailable)
+		return
+	}
+	captchaMutex.Unlock()
+
+	url := r.URL.Query().Get("url")
+	if url == "" {
+		http.Error(w, "Параметр 'url' обязателен", http.StatusBadRequest)
+		return
+	}
+
+	tabCtx, cancelTab := chromedp.NewContext(persistentBrowserCtx)
+	defer func() {
+		log.Println("ЛОГ: Шаг [4] - Обработчик завершен, закрываю вкладку.")
+		cancelTab()
+	}()
+
+	var response Response
+
+	log.Println("ЛОГ: Шаг [0] - Начинаю выполнение задач в новой вкладке.")
+	err := chromedp.Run(tabCtx,
+		chromedp.Navigate(url),
+		chromedp.WaitVisible(`body`, chromedp.ByQuery),
+		detectAndPauseOnCaptcha(url),
+		chromedp.ActionFunc(func(c context.Context) error {
+			log.Println("ЛОГ: Шаг [2] - Собираю данные со страницы.")
+			// --- Полная логика сбора данных ---
+			if r.URL.Query().Has("content") {
+				var content string
+				if err := chromedp.Text(`body`, &content, chromedp.ByQuery).Do(c); err != nil {
+					return err
+				}
 				response.Content = strings.TrimSpace(content)
-				return nil
-			}))
-		}
-		if r.URL.Query().Has("links") {
-			var nodes []*cdp.Node
-			tasks = append(tasks, chromedp.Nodes("a", &nodes, chromedp.ByQueryAll))
-			tasks = append(tasks, chromedp.ActionFunc(func(ctx context.Context) error {
-				taskCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-				defer cancel()
+			}
+			if r.URL.Query().Has("links") {
+				var nodes []*cdp.Node
+				if err := chromedp.Nodes("a", &nodes, chromedp.ByQueryAll).Do(c); err != nil {
+					return err
+				}
 				for _, node := range nodes {
 					href := node.AttributeValue("href")
-					if href == "" || strings.HasPrefix(href, "#") || strings.HasPrefix(href, "javascript:") {
+					if href == "" || strings.HasPrefix(href, "#") {
 						continue
 					}
 					var text string
-					err := chromedp.Run(taskCtx, chromedp.Text(node.FullXPath(), &text, chromedp.BySearch))
-					if err == nil && strings.TrimSpace(text) != "" {
-						response.Links = append(response.Links, Link{
-							Href: href,
-							Text: strings.TrimSpace(text),
-						})
-					}
+					// Используем Do(c), чтобы выполнить действие в текущем контексте вкладки
+					_ = chromedp.Text(node.FullXPath(), &text, chromedp.BySearch).Do(c)
+					response.Links = append(response.Links, Link{
+						Href: href,
+						Text: strings.TrimSpace(text),
+					})
 				}
-				return nil
-			}))
-		}
-		if r.URL.Query().Has("meta") {
-			var meta Meta
-			tasks = append(tasks, chromedp.Title(&meta.Title))
-			tasks = append(tasks, chromedp.AttributeValue(`meta[name="description"]`, "content", &meta.Description, nil, chromedp.ByQuery))
-			tasks = append(tasks, chromedp.AttributeValue(`meta[name="keywords"]`, "content", &meta.Keywords, nil, chromedp.ByQuery))
-			tasks = append(tasks, chromedp.ActionFunc(func(c context.Context) error {
+			}
+			if r.URL.Query().Has("meta") {
+				var meta Meta
+				_ = chromedp.Title(&meta.Title).Do(c)
+				_ = chromedp.AttributeValue(`meta[name="description"]`, "content", &meta.Description, nil, chromedp.ByQuery).Do(c)
+				_ = chromedp.AttributeValue(`meta[name="keywords"]`, "content", &meta.Keywords, nil, chromedp.ByQuery).Do(c)
 				response.Meta = &meta
-				return nil
-			}))
-		}
+			}
+			// --- Конец логики сбора данных ---
+			log.Println("ЛОГ: Шаг [3] - Сбор данных завершен.")
+			return nil
+		}),
+	)
 
-		if err := chromedp.Run(ctx, tasks); err != nil {
-			log.Printf("Ошибка при выполнении скрапинга для URL %s: %v", url, err)
-			http.Error(w, "Не удалось выполнить скрапинг: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
+	if err != nil {
+		log.Printf("ЛОГ: Ошибка во время выполнения chromedp: %v", err)
+		http.Error(w, "Не удалось выполнить скрапинг: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		json.NewEncoder(w).Encode(response)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(response)
+}
+
+// ... (manageConsoleInput и main без изменений) ...
+func manageConsoleInput() {
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		reader.ReadString('\n')
+		captchaMutex.Lock()
+		if isCaptchaPending {
+			isCaptchaPending = false
+			log.Println("ЛОГ: Консоль: получен Enter, флаг CAPTCHA снят.")
+		}
+		captchaMutex.Unlock()
 	}
 }
 
 func main() {
-	headless := flag.Bool("headless", true, "Запуск браузера в headless режиме")
+	_ = godotenv.Load()
+	headless := flag.Bool("headless", false, "Запуск браузера в headless режиме")
 	flag.Parse()
 
-	// !!! ИЗМЕНЕНО: Добавляем опции для маскировки
+	if *headless {
+		log.Fatal("КРИТИЧЕСКАЯ ОШИБКА: Этот режим требует ручного ввода и не может работать с флагом -headless=true")
+	}
+
+	go manageConsoleInput()
+
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", *headless),
-		// Устанавливаем "человеческий" User-Agent
 		chromedp.UserAgent(`Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36`),
-		// Отключаем флаги, которые выдают автоматизацию
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
 		chromedp.NoSandbox,
 		chromedp.DisableGPU,
 	)
 
-	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer cancel()
+	allocCtx, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer cancelAlloc()
 
-	// Создаем контекст для логгирования, чтобы видеть сообщения от браузера (полезно для отладки)
-	logCtx, cancel := chromedp.NewContext(allocCtx, chromedp.WithLogf(log.Printf))
-	defer cancel()
+	var cancelBrowser func()
+	persistentBrowserCtx, cancelBrowser = chromedp.NewContext(allocCtx, chromedp.WithLogf(log.Printf))
+	defer cancelBrowser()
 
-	// Убедимся, что браузер запущен, выполнив пустое действие
-	if err := chromedp.Run(logCtx, chromedp.ActionFunc(func(ctx context.Context) error {
-		return nil
-	})); err != nil {
+	if err := chromedp.Run(persistentBrowserCtx); err != nil {
 		log.Fatalf("Не удалось запустить браузер: %v", err)
 	}
+	log.Println("ЛОГ: Постоянный экземпляр браузера успешно запущен.")
 
-	http.HandleFunc("/scrape", scrapeHandler(logCtx)) // Используем контекст с логгером
+	http.HandleFunc("/scrape", scrapeHandler)
 
-	log.Println("Сервер запущен на http://localhost:8080")
-	if *headless {
-		log.Println("Режим: headless")
-	} else {
-		log.Println("Режим: с графическим интерфейсом (non-headless)")
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
-
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	addr := ":" + port
+	log.Printf("Сервер запущен на http://localhost%s", addr)
+	log.Println("Режим: с графическим интерфейсом (non-headless)")
+	log.Fatal(http.ListenAndServe(addr, nil))
 }
