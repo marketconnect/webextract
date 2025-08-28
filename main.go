@@ -19,29 +19,17 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// !!! НОВОЕ: Список ключевых слов для обнаружения CAPTCHA на разных сайтах !!!
+// ... (captchaKeywords, глобальные переменные и структуры остаются без изменений) ...
 var captchaKeywords = []string{
-	// Русские
-	"капча",
-	"не робот",
-	"подозрительная активность",
-	"подтвердите, что",
-
-	// Английские
-	"unusual traffic",
-	"are you a robot",
-	"prove you are human",
-	"captcha",
+	"капча", "не робот", "подозрительная активность", "подтвердите, что",
+	"unusual traffic", "are you a robot", "prove you are human", "captcha",
 }
-
-// --- Глобальное состояние для управления CAPTCHA ---
 var (
 	persistentBrowserCtx context.Context
 	isCaptchaPending     bool
 	captchaMutex         sync.Mutex
 )
 
-// ... (структуры Link, Meta, Response без изменений) ...
 type Link struct {
 	Href string `json:"href"`
 	Text string `json:"text"`
@@ -56,8 +44,11 @@ type Response struct {
 	Links   []Link `json:"links,omitempty"`
 	Meta    *Meta  `json:"meta,omitempty"`
 }
+type ErrorResponse struct {
+	Error string `json:"error"`
+}
 
-// ... (sendTelegramNotification без изменений) ...
+// ... (sendTelegramNotification и detectAndPauseOnCaptcha остаются без изменений) ...
 func sendTelegramNotification(message string) {
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	chatID := os.Getenv("TELEGRAM_CHAT_ID")
@@ -80,8 +71,6 @@ func sendTelegramNotification(message string) {
 		log.Printf("ЛОГ: Telegram API вернул ошибку: %s", resp.Status)
 	}
 }
-
-// detectAndPauseOnCaptcha - теперь проверяет по списку ключевых слов.
 func detectAndPauseOnCaptcha(url string) chromedp.Action {
 	return chromedp.ActionFunc(func(ctx context.Context) error {
 		log.Println("ЛОГ: Шаг [1] - Проверяю наличие CAPTCHA на странице.")
@@ -89,25 +78,17 @@ func detectAndPauseOnCaptcha(url string) chromedp.Action {
 		if err := chromedp.Text(`body`, &bodyText, chromedp.ByQuery).Do(ctx); err != nil {
 			return err
 		}
-
-		// Приводим текст страницы к нижнему регистру для надежного поиска
 		lowerBodyText := strings.ToLower(bodyText)
-
-		// !!! ИЗМЕНЕННАЯ ЛОГИКА: Ищем любое из ключевых слов !!!
 		for _, keyword := range captchaKeywords {
 			if strings.Contains(lowerBodyText, keyword) {
-				// Нашли! Запускаем процедуру ожидания.
 				captchaMutex.Lock()
 				isCaptchaPending = true
 				captchaMutex.Unlock()
-
 				message := fmt.Sprintf("🚨 ОБНАРУЖЕНА CAPTCHA! (Найдено слово: '%s') 🚨\n\nURL: %s\n\nДействие остановлено. Пожалуйста, решите капчу и нажмите Enter в этой консоли.", keyword, url)
 				go sendTelegramNotification(message)
-
 				log.Println("\n======================================================================")
 				log.Println(message)
 				log.Println("======================================================================")
-
 				for {
 					captchaMutex.Lock()
 					if !isCaptchaPending {
@@ -117,15 +98,19 @@ func detectAndPauseOnCaptcha(url string) chromedp.Action {
 					captchaMutex.Unlock()
 					time.Sleep(1 * time.Second)
 				}
-
 				log.Println("ЛОГ: Enter нажат, продолжаю выполнение...")
 				return chromedp.Sleep(2 * time.Second).Do(ctx)
 			}
 		}
-
 		log.Println("ЛОГ: Шаг [1] - CAPTCHA не обнаружена, продолжаю.")
 		return nil
 	})
+}
+
+func writeJsonError(w http.ResponseWriter, message string, statusCode int) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(ErrorResponse{Error: message})
 }
 
 func scrapeHandler(w http.ResponseWriter, r *http.Request) {
@@ -135,78 +120,92 @@ func scrapeHandler(w http.ResponseWriter, r *http.Request) {
 	if isCaptchaPending {
 		captchaMutex.Unlock()
 		log.Println("ЛОГ: Отклоняю запрос, так как уже решается CAPTCHA.")
-		http.Error(w, "Сервис занят решением CAPTCHA. Попробуйте позже.", http.StatusServiceUnavailable)
+		writeJsonError(w, "Сервис занят решением CAPTCHA. Попробуйте позже.", http.StatusServiceUnavailable)
 		return
 	}
 	captchaMutex.Unlock()
 
 	url := r.URL.Query().Get("url")
 	if url == "" {
-		http.Error(w, "Параметр 'url' обязателен", http.StatusBadRequest)
+		writeJsonError(w, "Параметр 'url' обязателен", http.StatusBadRequest)
 		return
 	}
 
 	tabCtx, cancelTab := chromedp.NewContext(persistentBrowserCtx)
-	defer func() {
-		log.Println("ЛОГ: Шаг [4] - Обработчик завершен, закрываю вкладку.")
-		cancelTab()
-	}()
+	defer cancelTab()
 
 	var response Response
+	var tasks chromedp.Tasks
 
-	log.Println("ЛОГ: Шаг [0] - Начинаю выполнение задач в новой вкладке.")
-	err := chromedp.Run(tabCtx,
-		chromedp.Navigate(url),
-		chromedp.WaitVisible(`body`, chromedp.ByQuery),
-		detectAndPauseOnCaptcha(url),
-		chromedp.ActionFunc(func(c context.Context) error {
-			log.Println("ЛОГ: Шаг [2] - Собираю данные со страницы.")
-			// --- Полная логика сбора данных ---
-			if r.URL.Query().Has("content") {
-				var content string
-				if err := chromedp.Text(`body`, &content, chromedp.ByQuery).Do(c); err != nil {
-					return err
-				}
-				response.Content = strings.TrimSpace(content)
-			}
-			if r.URL.Query().Has("links") {
-				var nodes []*cdp.Node
-				if err := chromedp.Nodes("a", &nodes, chromedp.ByQueryAll).Do(c); err != nil {
-					return err
-				}
-				for _, node := range nodes {
-					href := node.AttributeValue("href")
-					if href == "" || strings.HasPrefix(href, "#") {
-						continue
-					}
-					var text string
-					// Используем Do(c), чтобы выполнить действие в текущем контексте вкладки
-					_ = chromedp.Text(node.FullXPath(), &text, chromedp.BySearch).Do(c)
-					response.Links = append(response.Links, Link{
-						Href: href,
-						Text: strings.TrimSpace(text),
-					})
-				}
-			}
-			if r.URL.Query().Has("meta") {
-				var meta Meta
-				_ = chromedp.Title(&meta.Title).Do(c)
-				_ = chromedp.AttributeValue(`meta[name="description"]`, "content", &meta.Description, nil, chromedp.ByQuery).Do(c)
-				_ = chromedp.AttributeValue(`meta[name="keywords"]`, "content", &meta.Keywords, nil, chromedp.ByQuery).Do(c)
-				response.Meta = &meta
-			}
-			// --- Конец логики сбора данных ---
-			log.Println("ЛОГ: Шаг [3] - Сбор данных завершен.")
-			return nil
-		}),
+	tasks = append(tasks, chromedp.Navigate(url))
+	tasks = append(tasks, chromedp.WaitVisible(`body`, chromedp.ByQuery))
+	tasks = append(tasks, detectAndPauseOnCaptcha(url))
+
+	// --- Временные переменные для безопасного сбора данных ---
+	var (
+		content   string
+		meta      Meta
+		descOK    bool // Флаг, что description найден
+		keysOK    bool // Флаг, что keywords найден
+		linkNodes []*cdp.Node
 	)
 
-	if err != nil {
+	// --- Динамически строим ПЛОСКИЙ список задач ---
+	if r.URL.Query().Has("content") {
+		log.Println("ЛОГ: Добавляю в очередь задачу: сбор КОНТЕНТА.")
+		tasks = append(tasks, chromedp.Text(`body`, &content, chromedp.ByQuery))
+	}
+
+	if r.URL.Query().Has("meta") {
+		log.Println("ЛОГ: Добавляю в очередь задачу: сбор МЕТА-ДАННЫХ.")
+		tasks = append(tasks,
+			chromedp.Title(&meta.Title),
+			// !!! ГЛАВНОЕ ИСПРАВЛЕНИЕ: Передаем указатели на `descOK` и `keysOK` !!!
+			// Это делает поиск НЕБЛОКИРУЮЩИМ. Если тега нет, `ok` станет `false`, и мы пойдем дальше.
+			chromedp.AttributeValue(`meta[name="description"]`, "content", &meta.Description, &descOK, chromedp.ByQuery),
+			chromedp.AttributeValue(`meta[name="keywords"]`, "content", &meta.Keywords, &keysOK, chromedp.ByQuery),
+		)
+	}
+
+	if r.URL.Query().Has("links") {
+		log.Println("ЛОГ: Добавляю в очередь задачу: сбор ССЫЛОК.")
+		tasks = append(tasks, chromedp.Nodes("a", &linkNodes, chromedp.ByQueryAll))
+	}
+
+	// --- Финальное действие: обработка всех собранных данных ---
+	tasks = append(tasks, chromedp.ActionFunc(func(ctx context.Context) error {
+		log.Println("ЛОГ: Шаг [2] - Обрабатываю собранные данные.")
+		if r.URL.Query().Has("content") {
+			response.Content = strings.TrimSpace(content)
+		}
+		if r.URL.Query().Has("meta") {
+			response.Meta = &meta
+		}
+		if r.URL.Query().Has("links") {
+			for _, node := range linkNodes {
+				href := node.AttributeValue("href")
+				if href == "" || strings.HasPrefix(href, "#") || strings.HasPrefix(href, "javascript:") {
+					continue
+				}
+				var text string
+				_ = chromedp.TextContent(node.FullXPath(), &text, chromedp.BySearch).Do(ctx)
+				response.Links = append(response.Links, Link{
+					Href: href,
+					Text: strings.TrimSpace(text),
+				})
+			}
+		}
+		return nil
+	}))
+
+	log.Println("ЛОГ: Шаг [0] - Начинаю выполнение всех задач.")
+	if err := chromedp.Run(tabCtx, tasks); err != nil {
 		log.Printf("ЛОГ: Ошибка во время выполнения chromedp: %v", err)
-		http.Error(w, "Не удалось выполнить скрапинг: "+err.Error(), http.StatusInternalServerError)
+		writeJsonError(w, "Не удалось выполнить скрапинг: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	log.Println("ЛОГ: Все задачи успешно выполнены.")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(response)
 }
